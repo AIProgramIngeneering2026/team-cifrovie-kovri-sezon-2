@@ -69,7 +69,7 @@ stateDiagram-v2
 | `retry` | `created`, `running`, `finished`, `cancelled` | `409`, `code: invalid_transition` |
 | `cancel` / `retry` чужого, удалённого или несуществующего задания | любое | `404` — существование чужого задания не раскрывается |
 
-Тело ответа `409` (единый формат ошибок API):
+Тело ответа `409` (единый формат ошибок API — схема `Error` в [api/openapi.yaml](api/openapi.yaml)):
 
 ```json
 {
