@@ -1,0 +1,1894 @@
+openapi: 3.0.3
+
+info:
+  title: Сервис асинхронного выполнения заданий
+  version: 1.0.0
+  description: |
+    Контракт HTTP API сервиса асинхронного выполнения заданий (Job). В API и коде задание называется `task`.
+
+    Связанные документы:
+    [requirements.md](../requirements.md) — сценарии и критерии приёмки,
+    [job-lifecycle.md](../job-lifecycle.md) — состояния и переходы задания,
+    [tool-contract.md](../tool-contract.md) — исполнители и их параметры,
+    [architecture.md](../architecture.md) — компоненты,
+    [ADR](../adr/) — принятые решения.
+
+    ## Аутентификация
+
+    Все операции, кроме входа и health check, требуют аутентификации одним из способов:
+
+    - **cookie `access_token`** — JWT, который выдаёт `POST /api/auth/validate-otp`. Используется веб-интерфейсом;
+    - **заголовок `X-API-Key`** — API-ключ, выпущенный через `POST /api/api-keys`. Используется скриптами
+      и внутренними инструментами.
+
+    Если переданы оба, используется cookie. Нет учётных данных, токен истёк или ключ неизвестен — `401`
+    с кодом `unauthorized`.
+
+    ## Единый формат ошибок
+
+    Любой ответ с кодом `4xx` или `5xx` имеет одно и то же тело — схема `Error`:
+
+    ```json
+    {
+      "error": {
+        "code": "validation_error",
+        "message": "Параметры запроса не прошли проверку",
+        "details": {
+          "fields": [
+            {"field": "params.seconds", "location": "body", "code": "less_than_minimum",
+             "message": "Значение должно быть не меньше 1"}
+          ]
+        }
+      }
+    }
+    ```
+
+    - `code` — машиночитаемый код из фиксированного списка (схема `ErrorCode`), на него опирается клиент;
+    - `message` — текст для человека, может меняться;
+    - `details` — дополнительные данные, состав зависит от `code`. Для `validation_error` всегда содержит
+      `fields` — список полей, которые не прошли проверку: путь к полю, где оно находится (`body`, `query`,
+      `path`, `header`), код и описание нарушения.
+
+    Сводка кодов ответа:
+
+    | HTTP | `error.code` | Когда |
+    |---|---|---|
+    | 401 | `unauthorized` | Нет учётных данных, токен истёк, API-ключ неизвестен или отозван |
+    | 401 | `otp_invalid`, `otp_expired` | Неверный или просроченный OTP-код |
+    | 404 | `not_found` | Ресурса нет, он удалён или принадлежит другому пользователю — эти случаи не различаются |
+    | 409 | `invalid_transition` | Действие недопустимо в текущем статусе задания (cancel, retry) |
+    | 409 | `task_active` | Удаление задания в статусе `created` или `running` |
+    | 409 | `idempotency_key_used` | Ключ идемпотентности принадлежит удалённому заданию |
+    | 409 | `schedule_invalid_state` | Действие недопустимо в текущем статусе расписания |
+    | 422 | `validation_error` | Тело, параметры пути или запроса, заголовки не прошли проверку |
+    | 500 | `internal_error` | Непредвиденная ошибка сервера; подробности только в логах |
+    | 503 | `service_unavailable` | Недоступна PostgreSQL или Redis |
+
+    ## Correlation ID
+
+    Каждый ответ содержит заголовок `X-Request-ID`. Если клиент передал его в запросе, значение
+    сохраняется, иначе сервис генерирует новое. Тот же идентификатор пишется во все логи обработки запроса
+    и выполнения задания — по нему ищут причину ошибки.
+
+    ## Уведомления по WebSocket
+
+    OpenAPI не описывает WebSocket, поэтому канал описан здесь, а схемы сообщений — в `components.schemas`
+    (`WsHello`, `TaskStatusEvent`).
+
+    - **Адрес:** `GET /api/tasks/ws` с заголовком `Upgrade: websocket`.
+    - **Аутентификация:** cookie `access_token` или заголовок `X-API-Key` при подключении. Без них сервер
+      закрывает соединение с кодом `1008 Policy Violation` до отправки каких-либо сообщений.
+    - **После подключения** сервер отправляет одно сообщение `WsHello`.
+    - **Далее** при каждом изменении статуса задания пользователя сервер отправляет `TaskStatusEvent`.
+      Пользователь получает события только своих заданий. Удаление задания событием не сопровождается,
+      потому что статус не меняется.
+    - **Гарантии доставки нет:** события, произошедшие при закрытом соединении, не накапливаются. После
+      переподключения клиент получает актуальное состояние через `GET /api/tasks` или `GET /api/tasks/{task_id}`.
+    - Клиент ничего не отправляет серверу; входящие сообщения игнорируются.
+tags:
+  - name: auth
+    description: Вход по email и одноразовому коду (OTP).
+  - name: api-keys
+    description: API-ключи для доступа скриптов и внутренних инструментов.
+  - name: tasks
+    description: |
+      Задания (Job): создание, список, просмотр, отмена, повторный запуск, удаление.
+      Состояния: `created`, `running`, `finished`, `failed`, `cancelled` — см. job-lifecycle.md.
+  - name: schedules
+    description: |
+      Расписания: однократный или периодический (cron) запуск задания. При срабатывании расписания
+      создаётся обычное задание, которое проходит тот же путь через очередь и воркер.
+  - name: health
+    description: Проверка работоспособности сервиса.
+
+security:
+  - cookieAuth: []
+  - apiKeyAuth: []
+
+paths:
+
+  # ---------------------------------------------------------------- auth
+
+  /api/auth/login:
+    post:
+      tags: [auth]
+      operationId: requestOtp
+      summary: Запросить одноразовый код входа
+      description: |
+        Отправляет на указанный email одноразовый код (OTP). Если пользователя с таким email ещё нет,
+        он создаётся — отдельной регистрации нет.
+
+        Код действует 15 минут. Повторный запрос выпускает новый код, прежний перестаёт действовать.
+
+        Ответ одинаков для нового и существующего пользователя. Письмо отправляется асинхронно через
+        очередь, поэтому успешный ответ означает «письмо поставлено на отправку», а не «доставлено».
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: user@example.com
+      responses:
+        '202':
+          description: Код выпущен, письмо поставлено на отправку.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+              example:
+                email: user@example.com
+                otp_expires_in: 900
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/auth/validate-otp:
+    post:
+      tags: [auth]
+      operationId: validateOtp
+      summary: Подтвердить код и получить токен
+      description: |
+        Проверяет одноразовый код. При успехе устанавливает cookie `access_token` (JWT, `HttpOnly`,
+        `SameSite=Lax`) и делает код недействительным: использовать его второй раз нельзя.
+
+        Неверный и просроченный код различаются кодом ошибки, чтобы клиент мог предложить запросить
+        новый код. Токены при ошибке не выдаются (requirements, «Ошибка 1»).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidateOtpRequest'
+            example:
+              email: user@example.com
+              otp: '482913'
+      responses:
+        '200':
+          description: Код верный, токен установлен в cookie.
+          headers:
+            Set-Cookie:
+              description: '`access_token=<JWT>; HttpOnly; SameSite=Lax; Path=/; Max-Age=<секунды>`'
+              schema:
+                type: string
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidateOtpResponse'
+              example:
+                user:
+                  id: 5f0c8a52-2f7e-4c1a-9a43-1b0f6a3c9d10
+                  email: user@example.com
+                access_token_expires_in: 3600
+        '401':
+          description: |
+            Код не подходит. `otp_invalid` — код неверный или для этого email код не запрашивался;
+            `otp_expired` — код верный, но истёк срок его действия.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalid:
+                  summary: Неверный код
+                  value:
+                    error:
+                      code: otp_invalid
+                      message: Неверный код
+                      details: {}
+                expired:
+                  summary: Код просрочен
+                  value:
+                    error:
+                      code: otp_expired
+                      message: Срок действия кода истёк, запросите новый
+                      details: {}
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ---------------------------------------------------------------- api keys
+
+  /api/api-keys:
+    post:
+      tags: [api-keys]
+      operationId: createApiKey
+      summary: Выпустить API-ключ
+      description: |
+        Выпускает новый API-ключ для текущего пользователя. Значение ключа возвращается **только в этом
+        ответе**: сервис хранит лишь его хеш и показать ключ повторно не может. Ключ передаётся
+        в заголовке `X-API-Key` и даёт те же права, что и вход по OTP.
+
+        Выпустить ключ можно только при входе через cookie: запрос с `X-API-Key` отклоняется с `401`,
+        чтобы утёкший ключ нельзя было использовать для выпуска новых.
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApiKeyCreateRequest'
+            example:
+              name: ci-script
+      responses:
+        '201':
+          description: Ключ выпущен.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyCreated'
+              example:
+                id: 0b6a1f8e-62b4-4f1e-9a0c-6d2f3c8b1e77
+                name: ci-script
+                key: ak_live_9f2c4e7a1b3d5f8e0a2c4e6b8d0f1a3c
+                created_at: '2026-11-15T10:00:00Z'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ---------------------------------------------------------------- tasks
+
+  /api/tasks:
+    get:
+      tags: [tasks]
+      operationId: listTasks
+      summary: Список своих заданий
+      description: |
+        Возвращает задания текущего пользователя, отсортированные по времени создания от новых к старым
+        (requirements, сценарий 2). Задания других пользователей и удалённые задания не возвращаются.
+
+        Постраничный вывод — через `limit` и `offset`; `total` в ответе — общее число заданий
+        с учётом фильтров.
+      parameters:
+        - name: limit
+          in: query
+          description: Сколько заданий вернуть.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          description: Сколько заданий пропустить от начала списка.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: status
+          in: query
+          description: Вернуть только задания в этом статусе.
+          schema:
+            $ref: '#/components/schemas/TaskStatus'
+        - name: schedule_id
+          in: query
+          description: Вернуть только задания, созданные этим расписанием.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Страница списка заданий.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    post:
+      tags: [tasks]
+      operationId: createTask
+      summary: Создать задание
+      description: |
+        Проверяет параметры по схеме исполнителя (Tool) указанного типа, сохраняет задание со статусом
+        `created`, ставит его в очередь и возвращает его (requirements, сценарий 1).
+
+        **Идемпотентность** ([ADR-0001](../adr/0001-idempotency.md)). Заголовок `Idempotency-Key`
+        обязателен. Ключ уникален в пределах пользователя:
+
+        - ключ новый — создаётся задание, ответ `201`;
+        - у пользователя уже есть задание с этим ключом — новое не создаётся, ответ `200` с существующим
+          заданием в его текущем состоянии. Тело повторного запроса не сравнивается с первым;
+        - задание с этим ключом удалено — ответ `409` с кодом `idempotency_key_used`, новое задание
+          не создаётся; нужен новый ключ ([ADR-0003](../adr/0003-job-deletion.md)).
+
+        **Недоступность хранилища или очереди** ([ADR-0002](../adr/0002-background-worker.md)). Если недоступна
+        PostgreSQL или Redis, ответ `503`: задание не сохраняется, повтор с тем же `Idempotency-Key` после
+        восстановления создаёт его.
+
+        **Проверка параметров.** Неизвестный тип или параметры, не подходящие под схему типа, — `422`;
+        задание не сохраняется и в очередь не попадает (requirements, «Ошибка 2»). Схемы параметров
+        и ограничения — в [tool-contract.md](../tool-contract.md).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskCreate'
+            examples:
+              asleep:
+                summary: Ожидание 10 секунд
+                value:
+                  name: pause
+                  type: asleep
+                  params:
+                    seconds: 10
+              fetch:
+                summary: Запрос двух URL
+                value:
+                  name: check apis
+                  type: fetch
+                  params:
+                    urls:
+                      - https://api.example.com/a
+                      - https://api.example.com/b
+              file_checksum:
+                summary: SHA-256 файла
+                value:
+                  name: iso checksum
+                  type: file_checksum
+                  params:
+                    url: https://example.com/file.iso
+                    max_bytes: 52428800
+              page_digest:
+                summary: Сводка страницы
+                value:
+                  name: digest
+                  type: page_digest
+                  params:
+                    url: https://example.com/article
+      responses:
+        '201':
+          description: Задание создано и поставлено в очередь.
+          headers:
+            Location:
+              description: Адрес созданного задания, `/api/tasks/{task_id}`.
+              schema:
+                type: string
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+              example:
+                id: 7d3f2a10-5b8c-4e6f-9a1d-2c4b6e8f0a12
+                name: pause
+                type: asleep
+                status: created
+                params:
+                  seconds: 10
+                result: null
+                error: null
+                schedule_id: null
+                created_at: '2026-11-15T10:00:00Z'
+                started_at: null
+                finished_at: null
+        '200':
+          description: |
+            Повторный запрос с уже использованным ключом. Новое задание не создано, возвращено
+            существующее в текущем состоянии.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Ключ идемпотентности принадлежит удалённому заданию.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: idempotency_key_used
+                  message: Ключ уже использован удалённым заданием, передайте новый ключ
+                  details:
+                    idempotency_key: 2b9d6c1e-create-pause
+        '422':
+          description: |
+            Запрос не прошёл проверку: нет заголовка `Idempotency-Key`, неизвестный `type`, параметры
+            не подходят под схему типа. Каждое нарушение — отдельный элемент `details.fields`.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                bad_seconds:
+                  summary: Неположительное seconds для asleep
+                  value:
+                    error:
+                      code: validation_error
+                      message: Параметры запроса не прошли проверку
+                      details:
+                        fields:
+                          - field: params.seconds
+                            location: body
+                            code: less_than_minimum
+                            message: Значение должно быть не меньше 1
+                unknown_type:
+                  summary: Неподдерживаемый тип операции
+                  value:
+                    error:
+                      code: validation_error
+                      message: Параметры запроса не прошли проверку
+                      details:
+                        fields:
+                          - field: type
+                            location: body
+                            code: unknown_type
+                            message: 'Неизвестный тип операции: resize_image'
+                missing_key:
+                  summary: Нет ключа идемпотентности
+                  value:
+                    error:
+                      code: validation_error
+                      message: Параметры запроса не прошли проверку
+                      details:
+                        fields:
+                          - field: Idempotency-Key
+                            location: header
+                            code: required
+                            message: Заголовок обязателен
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/tasks/{task_id}:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    get:
+      tags: [tasks]
+      operationId: getTask
+      summary: Задание со статусом и результатом
+      description: |
+        Возвращает задание текущего пользователя: статус, параметры, результат (`finished`) или ошибку
+        (`failed`). Чужое, удалённое и несуществующее задание неразличимы — `404`
+        (requirements, сценарий 2).
+      responses:
+        '200':
+          description: Задание.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+              examples:
+                finished:
+                  summary: Задание fetch завершено, один URL недоступен
+                  value:
+                    id: 7d3f2a10-5b8c-4e6f-9a1d-2c4b6e8f0a12
+                    name: check apis
+                    type: fetch
+                    status: finished
+                    params:
+                      urls:
+                        - https://api.example.com/a
+                        - https://down.example.com
+                    result:
+                      - url: https://api.example.com/a
+                        ok: true
+                        status_code: 200
+                        content_type: application/json
+                        body:
+                          value: 1
+                        error: null
+                      - url: https://down.example.com
+                        ok: false
+                        status_code: null
+                        content_type: null
+                        body: null
+                        error:
+                          code: network_error
+                          message: Connection refused
+                    error: null
+                    schedule_id: null
+                    created_at: '2026-11-15T10:00:00Z'
+                    started_at: '2026-11-15T10:00:01Z'
+                    finished_at: '2026-11-15T10:00:03Z'
+                failed:
+                  summary: Задание file_checksum отказало — файл больше лимита
+                  value:
+                    id: 1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+                    name: iso checksum
+                    type: file_checksum
+                    status: failed
+                    params:
+                      url: https://example.com/file.iso
+                      max_bytes: 52428800
+                    result: null
+                    error:
+                      code: too_large
+                      message: Размер файла превышает 52428800 байт
+                      details:
+                        max_bytes: 52428800
+                    schedule_id: null
+                    created_at: '2026-11-15T10:00:00Z'
+                    started_at: '2026-11-15T10:00:01Z'
+                    finished_at: '2026-11-15T10:00:09Z'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    delete:
+      tags: [tasks]
+      operationId: deleteTask
+      summary: Удалить задание
+      description: |
+        Мягко удаляет неактивное задание ([ADR-0003](../adr/0003-job-deletion.md)). Удаление — не переход
+        статуса: статус выполнения сохраняется, событие по WebSocket не отправляется.
+
+        - Статус `finished`, `failed` или `cancelled` — задание удаляется, `204`. После этого оно не видно
+          в списке, а `GET`, `cancel`, `retry` и повторный `DELETE` возвращают `404`.
+        - Статус `created` или `running` — `409` с кодом `task_active`; задание сначала нужно отменить.
+        - Ключ идемпотентности удалённого задания остаётся занятым.
+      responses:
+        '204':
+          description: Задание удалено.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Задание активно (`created` или `running`) — сначала отмените его.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: task_active
+                  message: Нельзя удалить выполняемое задание, сначала отмените его
+                  details:
+                    task_id: 7d3f2a10-5b8c-4e6f-9a1d-2c4b6e8f0a12
+                    status: running
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/tasks/{task_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [tasks]
+      operationId: cancelTask
+      summary: Отменить задание
+      description: |
+        Переход `cancel` ([job-lifecycle.md](../job-lifecycle.md)), допустим из `created` и `running`
+        (requirements, сценарий 4).
+
+        - Из `created` — задание не будет запущено воркером.
+        - Из `running` — статус сразу становится `cancelled`, исполнитель прерывается в ближайшей точке
+          проверки отмены; результат, который он успеет вернуть, отбрасывается.
+        - Из `finished`, `failed`, `cancelled` — `409` с кодом `invalid_transition`, статус не меняется.
+
+        Изменение статуса публикуется по WebSocket.
+      responses:
+        '200':
+          description: Задание отменено; в ответе — задание со статусом `cancelled`.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/InvalidTransition'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/tasks/{task_id}/retry:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [tasks]
+      operationId: retryTask
+      summary: Повторно запустить задание после ошибки
+      description: |
+        Переход `retry` ([job-lifecycle.md](../job-lifecycle.md)), допустим только из `failed`
+        (requirements, сценарий 6).
+
+        Прежняя ошибка очищается, задание переходит в `running` и снова ставится в очередь с теми же
+        параметрами; идентификатор задания не меняется. Из любого другого статуса — `409` с кодом
+        `invalid_transition`.
+
+        Это явное действие пользователя. Автоматические повторы после сбоя воркера происходят внутри
+        `running` и этим методом не управляются ([ADR-0002](../adr/0002-background-worker.md)).
+      responses:
+        '200':
+          description: Задание перезапущено; в ответе — задание со статусом `running`.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/InvalidTransition'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ---------------------------------------------------------------- schedules
+
+  /api/schedules:
+    get:
+      tags: [schedules]
+      operationId: listSchedules
+      summary: Список своих расписаний
+      description: Расписания текущего пользователя от новых к старым. Удалённые расписания не возвращаются.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: status
+          in: query
+          description: Вернуть только расписания в этом статусе.
+          schema:
+            $ref: '#/components/schemas/ScheduleStatus'
+      responses:
+        '200':
+          description: Страница списка расписаний.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchedulePage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    post:
+      tags: [schedules]
+      operationId: createSchedule
+      summary: Создать расписание
+      description: |
+        Создаёт расписание в статусе `active`. Тип и параметры задания проверяются по той же схеме
+        исполнителя, что и в `POST /api/tasks`, — сразу при создании расписания, а не при срабатывании.
+
+        Триггер:
+
+        - `once` — однократный запуск в момент `run_at`; время должно быть в будущем. После срабатывания
+          расписание переходит в `completed`;
+        - `cron` — периодический запуск по cron-выражению из пяти полей (минута, час, день месяца, месяц,
+          день недели) в часовом поясе `timezone`.
+
+        Планировщик проверяет расписания раз в минуту, поэтому задание создаётся с точностью до минуты.
+        Для одного срабатывания создаётся не больше одного задания. Пропущенные во время недоступности
+        сервиса срабатывания задним числом не выполняются.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduleCreate'
+            examples:
+              cron:
+                summary: По будням в 9:00 по Москве
+                value:
+                  name: morning check
+                  type: fetch
+                  params:
+                    urls:
+                      - https://api.example.com/health
+                  trigger:
+                    kind: cron
+                    cron: 0 9 * * 1-5
+                    timezone: Europe/Moscow
+              once:
+                summary: Однократно
+                value:
+                  name: one-off digest
+                  type: page_digest
+                  params:
+                    url: https://example.com/article
+                  trigger:
+                    kind: once
+                    run_at: '2026-11-20T12:00:00Z'
+      responses:
+        '201':
+          description: Расписание создано.
+          headers:
+            Location:
+              description: Адрес созданного расписания, `/api/schedules/{schedule_id}`.
+              schema:
+                type: string
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Schedule'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: |
+            Расписание не прошло проверку: неверное cron-выражение, неизвестный часовой пояс, `run_at`
+            в прошлом, неизвестный тип операции, параметры не подходят под схему типа.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                bad_cron:
+                  summary: Неверное cron-выражение
+                  value:
+                    error:
+                      code: validation_error
+                      message: Параметры запроса не прошли проверку
+                      details:
+                        fields:
+                          - field: trigger.cron
+                            location: body
+                            code: invalid_cron
+                            message: 'Ожидается 5 полей, получено 4: "0 9 * *"'
+                past_run_at:
+                  summary: Время запуска в прошлом
+                  value:
+                    error:
+                      code: validation_error
+                      message: Параметры запроса не прошли проверку
+                      details:
+                        fields:
+                          - field: trigger.run_at
+                            location: body
+                            code: in_past
+                            message: Время запуска должно быть в будущем
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/schedules/{schedule_id}:
+    parameters:
+      - $ref: '#/components/parameters/ScheduleId'
+    get:
+      tags: [schedules]
+      operationId: getSchedule
+      summary: Расписание
+      description: |
+        Возвращает расписание текущего пользователя со временем следующего и последнего запуска.
+        Задания, созданные расписанием, — `GET /api/tasks?schedule_id={schedule_id}`.
+      responses:
+        '200':
+          description: Расписание.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Schedule'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    delete:
+      tags: [schedules]
+      operationId: deleteSchedule
+      summary: Удалить расписание
+      description: |
+        Удаляет расписание в любом статусе: новые задания по нему больше не создаются. Уже созданные
+        по расписанию задания сохраняются и продолжают выполняться; их `schedule_id` остаётся прежним.
+        Повторное удаление — `404`.
+      responses:
+        '204':
+          description: Расписание удалено.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/schedules/{schedule_id}/pause:
+    parameters:
+      - $ref: '#/components/parameters/ScheduleId'
+    post:
+      tags: [schedules]
+      operationId: pauseSchedule
+      summary: Приостановить расписание
+      description: |
+        Переводит расписание из `active` в `paused`: пока оно приостановлено, задания по нему не создаются.
+        Уже созданные задания не затрагиваются. Из `paused` и `completed` — `409` с кодом
+        `schedule_invalid_state`.
+      responses:
+        '200':
+          description: Расписание приостановлено; `next_run_at` равно `null`.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Schedule'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ScheduleInvalidState'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/schedules/{schedule_id}/resume:
+    parameters:
+      - $ref: '#/components/parameters/ScheduleId'
+    post:
+      tags: [schedules]
+      operationId: resumeSchedule
+      summary: Возобновить расписание
+      description: |
+        Переводит расписание из `paused` в `active` и пересчитывает `next_run_at` от текущего момента.
+        Срабатывания, пропущенные во время паузы, не выполняются.
+
+        Если это однократное расписание и его `run_at` уже прошёл, расписание переходит в `completed`
+        без запуска — ответ `200` с этим статусом. Из `active` и `completed` — `409` с кодом
+        `schedule_invalid_state`.
+      responses:
+        '200':
+          description: Расписание возобновлено (или завершено, если однократный запуск уже в прошлом).
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Schedule'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ScheduleInvalidState'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ---------------------------------------------------------------- health
+
+  /api/health:
+    get:
+      tags: [health]
+      operationId: healthCheck
+      summary: Проверка работоспособности
+      description: |
+        Проверяет доступность PostgreSQL и Redis. `200` — обе зависимости доступны; `503` — хотя бы одна
+        недоступна, в теле видно какая. Не требует аутентификации, не раскрывает версии и адреса.
+      security: []
+      responses:
+        '200':
+          description: Сервис работает.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: ok
+                checks:
+                  postgres: ok
+                  redis: ok
+        '503':
+          description: Недоступна хотя бы одна зависимость. Тело — `Health`, а не `Error`.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: unavailable
+                checks:
+                  postgres: ok
+                  redis: unavailable
+
+components:
+
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: access_token
+      description: JWT, выданный `POST /api/auth/validate-otp`.
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API-ключ, выпущенный `POST /api/api-keys`.
+
+  headers:
+    X-Request-ID:
+      description: Correlation ID запроса — тот же, что в логах сервиса и воркера.
+      schema:
+        type: string
+        example: 3f1c9e2a-7b4d-4e8f-a1c2-9d0e5b6a7c8f
+
+  parameters:
+    TaskId:
+      name: task_id
+      in: path
+      required: true
+      description: Идентификатор задания.
+      schema:
+        type: string
+        format: uuid
+    ScheduleId:
+      name: schedule_id
+      in: path
+      required: true
+      description: Идентификатор расписания.
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Ключ идемпотентности, который выбирает клиент — обычно UUID на каждое намерение создать задание.
+        При повторе запроса (таймаут, обрыв сети, двойной клик) клиент передаёт тот же ключ.
+        Уникален в пределах пользователя ([ADR-0001](../adr/0001-idempotency.md)).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        example: 2b9d6c1e-8a4f-4d3e-b7c6-1f0e9d8c7b6a
+
+  responses:
+    Unauthorized:
+      description: |
+        Нет учётных данных, токен недействителен или истёк, API-ключ неизвестен или отозван.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/X-Request-ID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: unauthorized
+              message: Требуется аутентификация
+              details: {}
+    NotFound:
+      description: |
+        Ресурс не найден. Тот же ответ для несуществующего, удалённого и чужого ресурса — существование
+        чужих данных не раскрывается.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/X-Request-ID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: not_found
+              message: Задание не найдено
+              details:
+                task_id: 7d3f2a10-5b8c-4e6f-9a1d-2c4b6e8f0a12
+    InvalidTransition:
+      description: |
+        Действие недопустимо в текущем статусе задания ([job-lifecycle.md](../job-lifecycle.md)).
+        Статус задания не изменился.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/X-Request-ID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: invalid_transition
+              message: Нельзя выполнить retry для задания в статусе finished
+              details:
+                task_id: 7d3f2a10-5b8c-4e6f-9a1d-2c4b6e8f0a12
+                status: finished
+                action: retry
+    ScheduleInvalidState:
+      description: Действие недопустимо в текущем статусе расписания. Статус не изменился.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/X-Request-ID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: schedule_invalid_state
+              message: Расписание уже приостановлено
+              details:
+                schedule_id: 4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f6a7b8
+                status: paused
+                action: pause
+    ValidationError:
+      description: |
+        Запрос не прошёл проверку. `details.fields` перечисляет все нарушения: какое поле, где оно
+        находится и что с ним не так.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/X-Request-ID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: validation_error
+              message: Параметры запроса не прошли проверку
+              details:
+                fields:
+                  - field: task_id
+                    location: path
+                    code: invalid_uuid
+                    message: Ожидается UUID
+    InternalError:
+      description: Непредвиденная ошибка сервера. Подробности — в логах по `X-Request-ID`.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/X-Request-ID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: internal_error
+              message: Внутренняя ошибка сервера
+              details: {}
+    ServiceUnavailable:
+      description: |
+        Недоступна зависимость сервиса (PostgreSQL или Redis). Запрос можно повторить позже; для
+        `POST /api/tasks` — с тем же `Idempotency-Key`.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/X-Request-ID'
+        Retry-After:
+          description: Через сколько секунд имеет смысл повторить запрос.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: service_unavailable
+              message: Сервис временно недоступен, повторите запрос позже
+              details: {}
+
+  schemas:
+
+    # ------------------------------------------------------------ errors
+
+    Error:
+      type: object
+      description: Единый формат ошибки для всех ответов `4xx` и `5xx`, кроме `503` у `/api/health`.
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code:
+              $ref: '#/components/schemas/ErrorCode'
+            message:
+              type: string
+              description: Описание для человека. Клиент не должен разбирать этот текст.
+            details:
+              type: object
+              description: |
+                Дополнительные данные; состав зависит от `code`:
+
+                - `validation_error` — `fields: FieldError[]`;
+                - `invalid_transition` — `task_id`, `status`, `action`;
+                - `task_active` — `task_id`, `status`;
+                - `schedule_invalid_state` — `schedule_id`, `status`, `action`;
+                - `idempotency_key_used` — `idempotency_key`;
+                - `not_found` — идентификатор запрошенного ресурса;
+                - остальные — пустой объект.
+              properties:
+                fields:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/FieldError'
+              additionalProperties: true
+
+    ErrorCode:
+      type: string
+      description: Машиночитаемый код ошибки API.
+      enum:
+        - unauthorized
+        - otp_invalid
+        - otp_expired
+        - not_found
+        - invalid_transition
+        - task_active
+        - idempotency_key_used
+        - schedule_invalid_state
+        - validation_error
+        - internal_error
+        - service_unavailable
+
+    FieldError:
+      type: object
+      description: Одно нарушение проверки — какое поле и что с ним не так.
+      required: [field, location, code, message]
+      properties:
+        field:
+          type: string
+          description: |
+            Путь к полю через точку, для элементов массива — индекс: `params.urls.2`. Для заголовка —
+            его имя, для параметра пути или запроса — имя параметра.
+          example: params.seconds
+        location:
+          type: string
+          enum: [body, query, path, header]
+          description: Где находится поле.
+        code:
+          type: string
+          description: |
+            Машиночитаемый вид нарушения: `required`, `invalid_type`, `less_than_minimum`,
+            `greater_than_maximum`, `too_short`, `too_long`, `invalid_format`, `invalid_uuid`,
+            `invalid_url`, `not_unique`, `unknown_type`, `unknown_field`, `invalid_cron`,
+            `invalid_timezone`, `in_past`.
+          example: less_than_minimum
+        message:
+          type: string
+          description: Описание нарушения для человека.
+          example: Значение должно быть не меньше 1
+
+    # ------------------------------------------------------------ auth
+
+    LoginRequest:
+      type: object
+      required: [email]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: Email пользователя. Регистр не учитывается.
+
+    LoginResponse:
+      type: object
+      required: [email, otp_expires_in]
+      properties:
+        email:
+          type: string
+          format: email
+        otp_expires_in:
+          type: integer
+          description: Через сколько секунд код перестанет действовать.
+          example: 900
+
+    ValidateOtpRequest:
+      type: object
+      required: [email, otp]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        otp:
+          type: string
+          pattern: '^[0-9]{6}$'
+          description: Шестизначный код из письма.
+
+    ValidateOtpResponse:
+      type: object
+      required: [user, access_token_expires_in]
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        access_token_expires_in:
+          type: integer
+          description: Через сколько секунд истечёт `access_token`; после этого нужен новый вход по OTP.
+
+    User:
+      type: object
+      required: [id, email]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+
+    # ------------------------------------------------------------ api keys
+
+    ApiKeyCreateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Название ключа, чтобы пользователь отличал ключи друг от друга.
+
+    ApiKeyCreated:
+      type: object
+      required: [id, key, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          nullable: true
+        key:
+          type: string
+          description: Значение ключа. Показывается один раз, повторно получить его нельзя.
+        created_at:
+          type: string
+          format: date-time
+
+    # ------------------------------------------------------------ tasks
+
+    TaskType:
+      type: string
+      description: Тип операции — какой исполнитель (Tool) выполнит задание.
+      enum: [asleep, fetch, file_checksum, page_digest]
+
+    TaskStatus:
+      type: string
+      description: |
+        Статус задания ([job-lifecycle.md](../job-lifecycle.md)):
+
+        - `created` — сохранено и поставлено в очередь, воркер ещё не взял;
+        - `running` — выполняется или ждёт воркера после retry;
+        - `finished` — результат сохранён в `result` (терминальный);
+        - `failed` — ошибка сохранена в `error`, можно выполнить retry;
+        - `cancelled` — отменено пользователем (терминальный).
+      enum: [created, running, finished, failed, cancelled]
+
+    TaskCreate:
+      description: |
+        Тело создания задания. Схема `params` определяется полем `type`.
+      oneOf:
+        - $ref: '#/components/schemas/AsleepTaskCreate'
+        - $ref: '#/components/schemas/FetchTaskCreate'
+        - $ref: '#/components/schemas/FileChecksumTaskCreate'
+        - $ref: '#/components/schemas/PageDigestTaskCreate'
+      discriminator:
+        propertyName: type
+        mapping:
+          asleep: '#/components/schemas/AsleepTaskCreate'
+          fetch: '#/components/schemas/FetchTaskCreate'
+          file_checksum: '#/components/schemas/FileChecksumTaskCreate'
+          page_digest: '#/components/schemas/PageDigestTaskCreate'
+
+    TaskCreateBase:
+      type: object
+      required: [name, type, params]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Название задания для пользователя.
+        type:
+          $ref: '#/components/schemas/TaskType'
+
+    AsleepTaskCreate:
+      allOf:
+        - $ref: '#/components/schemas/TaskCreateBase'
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [asleep]
+            params:
+              $ref: '#/components/schemas/AsleepParams'
+
+    FetchTaskCreate:
+      allOf:
+        - $ref: '#/components/schemas/TaskCreateBase'
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [fetch]
+            params:
+              $ref: '#/components/schemas/FetchParams'
+
+    FileChecksumTaskCreate:
+      allOf:
+        - $ref: '#/components/schemas/TaskCreateBase'
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [file_checksum]
+            params:
+              $ref: '#/components/schemas/FileChecksumParams'
+
+    PageDigestTaskCreate:
+      allOf:
+        - $ref: '#/components/schemas/TaskCreateBase'
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [page_digest]
+            params:
+              $ref: '#/components/schemas/PageDigestParams'
+
+    Task:
+      type: object
+      required: [id, name, type, status, params, result, error, schedule_id, created_at, started_at, finished_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        type:
+          $ref: '#/components/schemas/TaskType'
+        status:
+          $ref: '#/components/schemas/TaskStatus'
+        params:
+          description: Параметры задания в том виде, в котором они прошли проверку.
+          oneOf:
+            - $ref: '#/components/schemas/AsleepParams'
+            - $ref: '#/components/schemas/FetchParams'
+            - $ref: '#/components/schemas/FileChecksumParams'
+            - $ref: '#/components/schemas/PageDigestParams'
+        result:
+          description: |
+            Результат исполнителя. Заполнен только в статусе `finished`, иначе `null`. Схема определяется
+            полем `type`.
+          nullable: true
+          oneOf:
+            - $ref: '#/components/schemas/AsleepResult'
+            - $ref: '#/components/schemas/FetchResult'
+            - $ref: '#/components/schemas/FileChecksumResult'
+            - $ref: '#/components/schemas/PageDigestResult'
+        error:
+          description: Причина ошибки. Заполнена только в статусе `failed`, иначе `null`.
+          type: object
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/TaskError'
+        schedule_id:
+          type: string
+          nullable: true
+          format: uuid
+          description: Расписание, по которому создано задание; `null` — создано вручную.
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          nullable: true
+          format: date-time
+          description: Когда воркер начал последнюю попытку выполнения.
+        finished_at:
+          type: string
+          nullable: true
+          format: date-time
+          description: Когда задание перешло в `finished`, `failed` или `cancelled`.
+
+    TaskError:
+      type: object
+      description: |
+        Ошибка выполнения задания — в том же формате `{code, message, details}`, что и ошибки API
+        ([tool-contract.md](../tool-contract.md), раздел «Как Tool отказывает»).
+      required: [code, message, details]
+      properties:
+        code:
+          type: string
+          description: |
+            `too_large`, `not_html`, `http_status`, `network_error` — отказ исполнителя;
+            `invalid_params` — сохранённые параметры не подошли под схему при запуске;
+            `timeout`, `worker_lost` — исчерпаны попытки после таймаута или сбоя воркера;
+            `internal_error` — непредвиденная ошибка исполнителя.
+          enum: [too_large, not_html, http_status, network_error, invalid_params, timeout, worker_lost, internal_error]
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+
+    TaskPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Task'
+        total:
+          type: integer
+          description: Сколько всего заданий подходит под фильтры.
+        limit:
+          type: integer
+        offset:
+          type: integer
+
+    # ------------------------------------------------------------ tool params & results
+
+    AsleepParams:
+      type: object
+      required: [seconds]
+      additionalProperties: false
+      properties:
+        seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          description: Сколько секунд ждать.
+
+    AsleepResult:
+      type: object
+      required: [slept_seconds]
+      properties:
+        slept_seconds:
+          type: integer
+
+    FetchParams:
+      type: object
+      required: [urls]
+      additionalProperties: false
+      properties:
+        urls:
+          type: array
+          minItems: 1
+          maxItems: 20
+          uniqueItems: true
+          items:
+            type: string
+            format: uri
+            pattern: '^https?://'
+          description: Адреса для параллельного запроса, только `http` и `https`.
+
+    FetchResult:
+      type: array
+      description: |
+        Ответы в порядке `params.urls`. Недоступный URL — элемент с `ok: false`, а не ошибка задания.
+      items:
+        $ref: '#/components/schemas/FetchItem'
+
+    FetchItem:
+      type: object
+      required: [url, ok, status_code, content_type, body, error]
+      properties:
+        url:
+          type: string
+          format: uri
+        ok:
+          type: boolean
+          description: '`true` — получен ответ `2xx` не больше 1 МБ.'
+        status_code:
+          type: integer
+          nullable: true
+          description: Код ответа; `null`, если ответа не было.
+        content_type:
+          type: string
+          nullable: true
+        body:
+          description: Разобранный JSON, если ответ в JSON; иначе текст, обрезанный до 64 КБ; `null` при ошибке.
+          nullable: true
+        error:
+          type: object
+          nullable: true
+          description: Ошибка по этому URL; `null`, если `ok` равно `true`.
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [http_status, network_error, timeout, too_large]
+            message:
+              type: string
+
+    FileChecksumParams:
+      type: object
+      required: [url]
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          format: uri
+          pattern: '^https?://'
+        max_bytes:
+          type: integer
+          minimum: 1
+          maximum: 104857600
+          default: 104857600
+          description: Предел размера файла; больше — задание отказывает с `too_large`.
+
+    FileChecksumResult:
+      type: object
+      required: [url, size_bytes, sha256, content_type]
+      properties:
+        url:
+          type: string
+          format: uri
+        size_bytes:
+          type: integer
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        content_type:
+          type: string
+          nullable: true
+
+    PageDigestParams:
+      type: object
+      required: [url]
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          format: uri
+          pattern: '^https?://'
+
+    PageDigestResult:
+      type: object
+      required: [url, final_url, title, description, lang, words, links]
+      properties:
+        url:
+          type: string
+          format: uri
+        final_url:
+          type: string
+          format: uri
+          description: Адрес после перенаправлений.
+        title:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+          description: Содержимое `<meta name="description">`.
+        lang:
+          type: string
+          nullable: true
+          description: Атрибут `lang` элемента `<html>`.
+        words:
+          type: integer
+          description: Число слов в видимом тексте.
+        links:
+          type: integer
+          description: Число ссылок `<a href>`.
+
+    # ------------------------------------------------------------ schedules
+
+    ScheduleStatus:
+      type: string
+      description: |
+        - `active` — по расписанию создаются задания;
+        - `paused` — приостановлено, задания не создаются;
+        - `completed` — однократное расписание сработало или его время прошло; изменить нельзя, только удалить.
+      enum: [active, paused, completed]
+
+    ScheduleTrigger:
+      oneOf:
+        - $ref: '#/components/schemas/OnceTrigger'
+        - $ref: '#/components/schemas/CronTrigger'
+      discriminator:
+        propertyName: kind
+        mapping:
+          once: '#/components/schemas/OnceTrigger'
+          cron: '#/components/schemas/CronTrigger'
+
+    OnceTrigger:
+      type: object
+      required: [kind, run_at]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [once]
+        run_at:
+          type: string
+          format: date-time
+          description: Момент запуска с часовым поясом; при создании — в будущем.
+
+    CronTrigger:
+      type: object
+      required: [kind, cron]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [cron]
+        cron:
+          type: string
+          description: Cron-выражение из пяти полей.
+          example: 0 9 * * 1-5
+        timezone:
+          type: string
+          default: UTC
+          description: Часовой пояс IANA, в котором вычисляется выражение.
+          example: Europe/Moscow
+
+    ScheduleCreate:
+      type: object
+      required: [name, type, params, trigger]
+      description: |
+        Тип и параметры задания, которое будет создаваться при каждом срабатывании. `params` проверяются
+        по схеме типа так же, как в `TaskCreate`.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Название; оно же станет названием создаваемых заданий.
+        type:
+          $ref: '#/components/schemas/TaskType'
+        params:
+          oneOf:
+            - $ref: '#/components/schemas/AsleepParams'
+            - $ref: '#/components/schemas/FetchParams'
+            - $ref: '#/components/schemas/FileChecksumParams'
+            - $ref: '#/components/schemas/PageDigestParams'
+        trigger:
+          $ref: '#/components/schemas/ScheduleTrigger'
+
+    Schedule:
+      type: object
+      required: [id, name, type, params, trigger, status, next_run_at, last_run_at, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        type:
+          $ref: '#/components/schemas/TaskType'
+        params:
+          oneOf:
+            - $ref: '#/components/schemas/AsleepParams'
+            - $ref: '#/components/schemas/FetchParams'
+            - $ref: '#/components/schemas/FileChecksumParams'
+            - $ref: '#/components/schemas/PageDigestParams'
+        trigger:
+          $ref: '#/components/schemas/ScheduleTrigger'
+        status:
+          $ref: '#/components/schemas/ScheduleStatus'
+        next_run_at:
+          type: string
+          nullable: true
+          format: date-time
+          description: Следующее срабатывание; `null` для `paused` и `completed`.
+        last_run_at:
+          type: string
+          nullable: true
+          format: date-time
+          description: Последнее срабатывание, после которого было создано задание.
+        created_at:
+          type: string
+          format: date-time
+
+    SchedulePage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Schedule'
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+
+    # ------------------------------------------------------------ health
+
+    Health:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [ok, unavailable]
+        checks:
+          type: object
+          required: [postgres, redis]
+          properties:
+            postgres:
+              type: string
+              enum: [ok, unavailable]
+            redis:
+              type: string
+              enum: [ok, unavailable]
+
+    # ------------------------------------------------------------ websocket
+
+    WsHello:
+      type: object
+      description: Первое сообщение после успешного подключения к `/api/tasks/ws`.
+      required: [type, user_id]
+      properties:
+        type:
+          type: string
+          enum: [hello]
+        user_id:
+          type: string
+          format: uuid
+      example:
+        type: hello
+        user_id: 5f0c8a52-2f7e-4c1a-9a43-1b0f6a3c9d10
+
+    TaskStatusEvent:
+      type: object
+      description: |
+        Событие изменения статуса задания пользователя. Отправляется при каждом переходе
+        ([job-lifecycle.md](../job-lifecycle.md)). Результат в событие не входит — его получают через
+        `GET /api/tasks/{task_id}`.
+      required: [type, task_id, status, occurred_at]
+      properties:
+        type:
+          type: string
+          enum: [task.status_changed]
+        task_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/TaskStatus'
+        occurred_at:
+          type: string
+          format: date-time
+      example:
+        type: task.status_changed
+        task_id: 7d3f2a10-5b8c-4e6f-9a1d-2c4b6e8f0a12
+        status: finished
+        occurred_at: '2026-11-15T10:00:03Z'
