@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -7,14 +8,46 @@ from app.domain.job import InvalidTransition, JobStatus
 from tests.fakes import EchoTool, InMemoryTasks, SlowTool, make_dispatcher, make_job
 
 S = JobStatus
+LEASE = timedelta(seconds=5)
+# Попытка, начатая давно: её срок истёк, воркер с ней точно не работает.
+LONG_AGO = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def test_z1_second_tool_in_same_job_is_rejected_by_job() -> None:
     job = make_job()
-    job.start_attempt(1)
+    job.start_attempt(1, LEASE)
     with pytest.raises(InvalidTransition):
-        job.start_attempt(1)  # тот же номер попытки — второй Tool параллельно
+        job.start_attempt(1, LEASE)  # тот же номер попытки — второй Tool параллельно
     assert (job.status, job.attempt) == (S.RUNNING, 1)
+
+
+def test_z1_next_attempt_is_rejected_while_previous_may_still_run() -> None:
+    job = make_job()
+    job.start_attempt(1, LEASE)
+    with pytest.raises(InvalidTransition):
+        job.start_attempt(2, LEASE)  # срок первой попытки не истёк — она может работать
+    assert (job.status, job.attempt) == (S.RUNNING, 1)
+
+
+def test_z1_next_attempt_while_first_tool_runs_does_not_start_second_tool() -> None:
+    async def scenario() -> None:
+        job = make_job()
+        tasks = InMemoryTasks(job)
+        tool = EchoTool(gate=asyncio.Event())
+        dispatcher = make_dispatcher(tasks, tool)
+
+        first = asyncio.create_task(dispatcher.dispatch(str(job.id), 1))
+        await tool.started.wait()
+        await dispatcher.dispatch(str(job.id), 2)  # повтор ARQ, пока первый Tool жив
+        assert tool.gate is not None
+        tool.gate.set()
+        await first
+
+        assert (tool.calls, tool.max_running) == (1, 1)
+        assert (job.status, job.attempt) == (S.FINISHED, 1)
+        assert tasks.rejected == ["run from running"]
+
+    asyncio.run(scenario())
 
 
 def test_z1_duplicate_delivery_while_running_does_not_start_second_tool() -> None:
@@ -43,7 +76,7 @@ def test_z1_duplicate_delivery_while_running_does_not_start_second_tool() -> Non
 def test_z2_redelivery_after_worker_crash_finishes_job() -> None:
     async def scenario() -> None:
         job = make_job()
-        job.start_attempt(1)  # воркер взял задание и упал, итог не записан
+        job.start_attempt(1, LEASE, at=LONG_AGO)  # воркер взял задание и упал
         tasks = InMemoryTasks(job)
         tool = EchoTool()
         await make_dispatcher(tasks, tool).dispatch(str(job.id), 2)
@@ -55,7 +88,7 @@ def test_z2_redelivery_after_worker_crash_finishes_job() -> None:
 def test_z2_attempts_exhausted_after_crash_fails_job() -> None:
     async def scenario() -> None:
         job = make_job()
-        job.start_attempt(3)  # последняя попытка тоже не вернулась
+        job.start_attempt(3, LEASE, at=LONG_AGO)  # последняя попытка не вернулась
         tasks = InMemoryTasks(job)
         tool = EchoTool()
         await make_dispatcher(tasks, tool, max_attempts=3).dispatch(str(job.id), 4)
@@ -183,7 +216,7 @@ def test_z6_finished_job_cannot_run_again(action: str) -> None:
             case "run":
                 job.run()
             case "start_attempt":
-                job.start_attempt(job.attempt + 1)
+                job.start_attempt(job.attempt + 1, LEASE)
             case _:
                 job.retry()
     assert job.status == S.FINISHED

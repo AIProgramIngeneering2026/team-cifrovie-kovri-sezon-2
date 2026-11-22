@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import ClassVar, override
 from uuid import uuid4
 
@@ -39,12 +40,14 @@ class InMemoryTasks:
         self.jobs: dict[str, Job] = {str(j.id): j for j in jobs}
         self.rejected: list[str] = []
 
-    async def start(self, job_id: str, attempt: int) -> JobToRun | None:
+    async def start(
+        self, job_id: str, attempt: int, lease: timedelta
+    ) -> JobToRun | None:
         job = self.jobs.get(job_id)
         if job is None or job.deleted_at is not None:
             return None
         try:
-            job.start_attempt(attempt)
+            job.start_attempt(attempt, lease)
         except InvalidTransition as exc:
             self.rejected.append(f"{exc.action} from {exc.status}")
             return None

@@ -56,13 +56,13 @@ def test_e2_invalid_params_fail_job_with_field_name_and_tool_not_called() -> Non
     asyncio.run(scenario())
 
 
-def test_unknown_operation_fails_job() -> None:
+def test_unknown_operation_fails_job_with_unknown_type() -> None:
     async def scenario() -> None:
         job = make_job("resize")
         await make_dispatcher(InMemoryTasks(job), EchoTool()).dispatch(str(job.id), 1)
         assert job.status == S.FAILED
         assert job.error is not None
-        assert job.error["code"] == "invalid_params"
+        assert job.error["code"] == "unknown_type"
         assert job.error["details"] == {"type": "resize"}
 
     asyncio.run(scenario())

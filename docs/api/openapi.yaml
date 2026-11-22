@@ -1536,9 +1536,10 @@ components:
           description: |
             `too_large`, `not_html`, `http_status`, `network_error` — отказ исполнителя;
             `invalid_params` — сохранённые параметры не подошли под схему при запуске;
+            `unknown_type` — тип операции сохранённого задания больше не зарегистрирован;
             `timeout`, `worker_lost` — исчерпаны попытки после таймаута или сбоя воркера;
             `internal_error` — непредвиденная ошибка исполнителя.
-          enum: [too_large, not_html, http_status, network_error, invalid_params, timeout, worker_lost, internal_error]
+          enum: [too_large, not_html, http_status, network_error, invalid_params, unknown_type, timeout, worker_lost, internal_error]
         message:
           type: string
         details:

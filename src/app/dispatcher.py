@@ -2,6 +2,7 @@ import asyncio
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Protocol
 
 from pydantic import BaseModel, ValidationError
@@ -28,11 +29,13 @@ class TaskService(Protocol):
     отмены оставляет задание в cancelled, а результат отбрасывается (job-lifecycle.md).
     """
 
-    async def start(self, job_id: str, attempt: int) -> JobToRun | None:
-        """Начать попытку attempt: created → running; в running — только следующая попытка.
+    async def start(
+        self, job_id: str, attempt: int, lease: timedelta
+    ) -> JobToRun | None:
+        """Начать попытку attempt на срок lease (Job.start_attempt).
 
-        None — запускать нельзя: задание отменено, завершено, удалено или эта попытка
-        уже выполняется.
+        None — запускать нельзя: задание отменено, завершено, удалено или предыдущая
+        попытка ещё может работать.
         """
         ...
 
@@ -80,7 +83,7 @@ class Dispatcher:
             )
             return
 
-        job = await self._tasks.start(job_id, attempt)
+        job = await self._tasks.start(job_id, attempt, self._attempt_lease())
         if job is None:
             logger.info(
                 "job %s: не запускается — статус не допускает выполнения", job_id
@@ -89,12 +92,9 @@ class Dispatcher:
 
         try:
             tool = self._registry.get(job.type)
-        except UnknownToolError:
+        except UnknownToolError as exc:
             await self._fail(
-                job_id,
-                "invalid_params",
-                "Тип операции не поддерживается",
-                {"type": job.type},
+                job_id, exc.code, "Тип операции не поддерживается", {"type": job.type}
             )
             return
 
@@ -131,6 +131,13 @@ class Dispatcher:
             return
 
         await self._tasks.finish(job_id, result.model_dump(mode="json"))
+
+    def _attempt_lease(self) -> timedelta:
+        """Дольше самого долгого timeout_seconds попытка не живёт: Tool прерывается здесь."""
+        timeouts = [
+            self._registry.get(t).timeout_seconds for t in self._registry.types()
+        ]
+        return timedelta(seconds=max(timeouts, default=0))
 
     async def _fail(
         self,
