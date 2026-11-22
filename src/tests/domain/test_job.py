@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -10,11 +10,14 @@ from app.domain.job import (
     JobAction,
     JobActive,
     JobStatus,
+    StaleAttempt,
 )
 
 S = JobStatus
 A = JobAction
 T0 = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
+ERROR: dict[str, object] = {"code": "network_error", "message": "…", "details": {}}
+LEASE = timedelta(seconds=5)
 
 # Ожидаемая таблица из docs/job-lifecycle.md, «Разрешённые переходы».
 ALLOWED = {
@@ -44,9 +47,9 @@ def apply(job: Job, action: JobAction) -> None:
         case A.RUN:
             job.run(T0)
         case A.FINISH:
-            job.finish({"slept_seconds": 10}, T0)
+            job.finish({"slept_seconds": 10}, attempt=job.attempt, at=T0)
         case A.FAIL:
-            job.fail({"code": "timeout", "message": "…", "details": {}}, T0)
+            job.fail(ERROR, attempt=job.attempt, at=T0)
         case A.CANCEL:
             job.cancel(T0)
         case A.RETRY:
@@ -93,7 +96,7 @@ def test_c1_cannot_return_to_created() -> None:
 def test_c1_happy_path_fills_timestamps_and_result() -> None:
     job = make_job()
     job.run(T0)
-    job.finish({"slept_seconds": 10}, T0)
+    job.finish({"slept_seconds": 10}, attempt=1, at=T0)
     assert (job.status, job.started_at, job.finished_at) == (S.FINISHED, T0, T0)
     assert job.result == {"slept_seconds": 10}
     assert job.is_terminal
@@ -102,10 +105,49 @@ def test_c1_happy_path_fills_timestamps_and_result() -> None:
 def test_c1_retry_clears_previous_error() -> None:
     job = make_job()
     job.run(T0)
-    job.fail({"code": "network_error", "message": "…", "details": {}}, T0)
+    job.fail(ERROR, attempt=1, at=T0)
     assert job.error is not None and not job.is_terminal
     job.retry()
     assert (job.status, job.error, job.finished_at) == (S.RUNNING, None, None)
+
+
+def test_c1_retry_means_waiting_for_worker() -> None:
+    # После retry задание ждёт воркера: времени старта и номера попытки ещё нет.
+    job = make_job()
+    job.run(T0)
+    job.fail(ERROR, attempt=1, at=T0)
+    job.retry()
+    assert (job.started_at, job.attempt) == (None, 0)
+    job.start_attempt(1, LEASE, at=T0)
+    assert (job.started_at, job.attempt) == (T0, 1)
+
+
+@pytest.mark.parametrize("action", [A.FINISH, A.FAIL])
+def test_z4_late_result_of_attempt_before_retry_is_rejected(action: JobAction) -> None:
+    # Попытка 1 упала по таймауту → failed → retry; Tool первой попытки всё же вернул итог.
+    job = make_job()
+    job.run(T0)
+    job.fail(ERROR, attempt=1, at=T0)
+    job.retry()
+    with pytest.raises(StaleAttempt) as exc_info:
+        if action is A.FINISH:
+            job.finish({"slept_seconds": 10}, attempt=1)
+        else:
+            job.fail(ERROR, attempt=1)
+    assert (job.status, job.result, job.finished_at) == (S.RUNNING, None, None)
+    assert exc_info.value.details["current_attempt"] == "0"
+
+
+def test_z4_result_of_current_attempt_after_retry_is_accepted() -> None:
+    job = make_job()
+    job.run(T0)
+    job.fail(ERROR, attempt=1, at=T0)
+    job.retry()
+    job.start_attempt(1, LEASE, at=T0)
+    with pytest.raises(StaleAttempt):
+        job.finish({"slept_seconds": 10}, attempt=2)  # чужой номер попытки
+    job.finish({"slept_seconds": 10}, attempt=1, at=T0)
+    assert (job.status, job.result) == (S.FINISHED, {"slept_seconds": 10})
 
 
 def test_c1_late_result_after_cancel_is_rejected() -> None:
@@ -114,7 +156,7 @@ def test_c1_late_result_after_cancel_is_rejected() -> None:
     job.run(T0)
     job.cancel(T0)
     with pytest.raises(InvalidTransition):
-        job.finish({"slept_seconds": 10})
+        job.finish({"slept_seconds": 10}, attempt=1)
     assert (job.status, job.result) == (S.CANCELLED, None)
 
 
