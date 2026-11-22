@@ -28,10 +28,11 @@ class TaskService(Protocol):
     отмены оставляет задание в cancelled, а результат отбрасывается (job-lifecycle.md).
     """
 
-    async def start(self, job_id: str) -> JobToRun | None:
-        """created → running; running (после retry или повтора ARQ) — без смены статуса.
+    async def start(self, job_id: str, attempt: int) -> JobToRun | None:
+        """Начать попытку attempt: created → running; в running — только следующая попытка.
 
-        None — запускать нельзя: задание отменено, завершено или удалено.
+        None — запускать нельзя: задание отменено, завершено, удалено или эта попытка
+        уже выполняется.
         """
         ...
 
@@ -79,7 +80,7 @@ class Dispatcher:
             )
             return
 
-        job = await self._tasks.start(job_id)
+        job = await self._tasks.start(job_id, attempt)
         if job is None:
             logger.info(
                 "job %s: не запускается — статус не допускает выполнения", job_id

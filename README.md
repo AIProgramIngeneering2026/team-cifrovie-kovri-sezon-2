@@ -62,6 +62,17 @@ Frontend:
 
 - Docker Compose — запуск приложения и зависимостей.
 
+## Запуск тестов
+
+Нужны Python 3.14 и [uv](https://docs.astral.sh/uv/). Из корня репозитория:
+
+```bash
+uv sync          # установить зависимости в .venv
+uv run pytest    # все тесты ядра одной командой
+```
+
+Проверки перед PR (CONTRIBUTING.md): `uv run ruff check`, `uv run basedpyright`, `uv run pytest`.
+
 ## Границы первой версии
 
 В систему входят:

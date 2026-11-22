@@ -50,7 +50,7 @@ def apply(job: Job, action: JobAction) -> None:
         case A.CANCEL:
             job.cancel(T0)
         case A.RETRY:
-            job.retry(T0)
+            job.retry()
 
 
 def test_c1_transition_table_matches_lifecycle_doc() -> None:
@@ -104,7 +104,7 @@ def test_c1_retry_clears_previous_error() -> None:
     job.run(T0)
     job.fail({"code": "network_error", "message": "…", "details": {}}, T0)
     assert job.error is not None and not job.is_terminal
-    job.retry(T0)
+    job.retry()
     assert (job.status, job.error, job.finished_at) == (S.RUNNING, None, None)
 
 

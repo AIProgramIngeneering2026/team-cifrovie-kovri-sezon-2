@@ -9,6 +9,8 @@ type AnyTool = Tool[Any, Any]  # pyright: ignore[reportExplicitAny]
 class UnknownToolError(KeyError):
     """Нет Tool для типа операции: при создании задания — 422."""
 
+    code: str = "unknown_type"
+
     def __init__(self, type_: str) -> None:
         super().__init__(type_)
         self.type_: str = type_

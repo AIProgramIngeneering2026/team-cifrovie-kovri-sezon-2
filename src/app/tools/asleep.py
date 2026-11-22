@@ -11,7 +11,9 @@ MAX_SECONDS = 3600
 class AsleepParams(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
-    seconds: int = Field(ge=1, le=MAX_SECONDS, description="Сколько секунд ждать.")
+    seconds: int = Field(
+        ge=1, le=MAX_SECONDS, strict=True, description="Сколько секунд ждать."
+    )
 
 
 class AsleepResult(BaseModel):

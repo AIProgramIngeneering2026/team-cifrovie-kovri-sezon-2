@@ -95,6 +95,8 @@ class Job:
     started_at: datetime | None = None
     finished_at: datetime | None = None
     deleted_at: datetime | None = None
+    # Номер текущей попытки воркера (ARQ job_try); 0 — воркер ещё не брал задание.
+    attempt: int = 0
 
     @property
     def is_terminal(self) -> bool:
@@ -105,8 +107,24 @@ class Job:
         return self.status in allowed_from
 
     def run(self, at: datetime | None = None) -> None:
-        """created → running: воркер забрал задание."""
+        """created → running: воркер забрал задание (первая попытка)."""
         self._transition(JobAction.RUN)
+        self.attempt = 1
+        self.started_at = at or _now()
+
+    def start_attempt(self, attempt: int, at: datetime | None = None) -> None:
+        """Воркер начинает попытку выполнения с номером attempt.
+
+        Из created — переход run. В running — только следующая попытка: повтор ARQ после
+        сбоя или первый запуск после retry. Попытка с тем же или меньшим номером — второй
+        Tool в том же Job, она отклоняется.
+        """
+        if self.status is not JobStatus.RUNNING or attempt <= self.attempt:
+            self._transition(
+                JobAction.RUN
+            )  # created → running, иначе InvalidTransition
+        # Попытка внутри running — не переход (job-lifecycle.md), статус не меняется.
+        self.attempt = attempt
         self.started_at = at or _now()
 
     def finish(self, result: object, at: datetime | None = None) -> None:
@@ -126,12 +144,14 @@ class Job:
         self._transition(JobAction.CANCEL)
         self.finished_at = at or _now()
 
-    def retry(self, at: datetime | None = None) -> None:
+    def retry(self) -> None:
         """failed → running: прежняя ошибка очищается, задание снова ждёт воркера."""
         self._transition(JobAction.RETRY)
         self.error = None
         self.finished_at = None
-        self.started_at = at or _now()
+        # Задание снова ждёт воркера: очередь начнёт нумерацию попыток заново.
+        self.attempt = 0
+        self.started_at = None
 
     def delete(self, at: datetime | None = None) -> None:
         """Мягкое удаление — не переход: статус не меняется (job-lifecycle.md)."""
