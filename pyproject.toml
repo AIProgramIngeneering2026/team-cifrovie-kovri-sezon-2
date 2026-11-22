@@ -1,0 +1,41 @@
+[project]
+name = "cifrovie-kovri"
+version = "0.1.0"
+description = "Сервис асинхронного выполнения заданий"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pydantic>=2.11",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.31",
+    "pytest>=8.4",
+    "ruff>=0.13",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["src/tests"]
+addopts = "-q"
+
+[tool.ruff]
+src = ["src"]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+# Длину кода держит ruff format; длинные докстринги и комментарии не переносим.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.basedpyright]
+include = ["src"]
+extraPaths = ["src"]
+pythonVersion = "3.14"

@@ -35,7 +35,11 @@ class Tool[P: BaseModel, R: BaseModel](ABC):
     type: ClassVar[str]                 # тип операции, ключ в Registry: "asleep", "fetch", ...
     params_model: ClassVar[type[BaseModel]]  # схема параметров — по ней проверяет TaskService
     result_model: ClassVar[type[BaseModel]]  # схема результата — сохраняется в Job.result
-    timeout_seconds: ClassVar[int]      # предел одной попытки выполнения
+    timeout_seconds: ClassVar[int]      # верхний предел одной попытки при любых параметрах
+
+    def timeout_for(self, params: P) -> int:
+        """Предел попытки для этих параметров, не больше timeout_seconds.
+        По умолчанию — timeout_seconds; Dispatcher прерывает run по нему."""
 
     @abstractmethod
     async def run(self, params: P, ctx: ToolContext) -> R:
@@ -88,7 +92,7 @@ Tool **не получает** и не должен знать: пользова
 | Операцию невозможно выполнить: файл больше лимита, ответ не HTML, сервер вернул ошибку для единственного URL | Выбрасывает `ToolError(code, message, details)` | `failed`, ошибка сохраняется в `Job.error` в формате `{code, message, details}`. Автоматического повтора нет: повторить может только пользователь через `retry`. |
 | Сетевая ошибка после всех повторов `HttpAdapter` | Превращает ошибку адаптера в `ToolError` (или в элемент результата, если операция допускает частичные неудачи) | `failed` или `finished` — по описанию конкретного Tool ниже. |
 | Непредвиденное исключение (ошибка в коде Tool) | Ничего не делает — исключение выходит из `run` | `failed` с кодом `internal_error`; подробности — только в логах, пользователю не раскрываются. |
-| Превышен `timeout_seconds` или воркер аварийно завершился | — | ARQ повторяет попытку внутри `running`; после исчерпания попыток — `failed` с кодом `timeout` или `worker_lost` ([ADR-0002](adr/0002-background-worker.md)). |
+| Превышен `timeout_for(params)` или воркер аварийно завершился | — | ARQ повторяет попытку внутри `running`; после исчерпания попыток — `failed` с кодом `timeout` или `worker_lost` ([ADR-0002](adr/0002-background-worker.md)). |
 | Отмена задания | Получает `asyncio.CancelledError` в ближайшей точке `await`, освобождает ресурсы (`finally` / `async with`) и пробрасывает исключение дальше | `cancelled` ([job-lifecycle.md](job-lifecycle.md)). Перехватывать и «глушить» `CancelledError` запрещено. |
 
 Коды ошибок — строки в `snake_case`, общие для всех Tool, если смысл совпадает: `http_status`,
@@ -104,7 +108,7 @@ Tool **не получает** и не должен знать: пользова
    и в очередь не попадает (requirements, «Ошибка 2»).
 2. `Dispatcher` перед запуском восстанавливает модель из сохранённых параметров. Если это не удалось
    (например, схема изменилась между версиями), задание переходит в `failed` с кодом `invalid_params`,
-   Tool не запускается.
+   Tool не запускается. Если Tool для типа задания больше не зарегистрирован — `failed` с кодом `unknown_type`.
 3. Tool доверяет полученным параметрам и не перепроверяет их формат. Tool проверяет только то, что
    нельзя знать до выполнения: фактический размер файла, тип содержимого ответа, код ответа сервера.
 
@@ -132,7 +136,7 @@ HTTP GET) и этому требованию удовлетворяют.
 | Результат | `{"slept_seconds": 10}` |
 | Отказы | Нет: операция всегда завершается, если её не отменили |
 | Отмена | Прерывает ожидание сразу |
-| `timeout_seconds` | `seconds + 30` |
+| `timeout_seconds` | 3630 (для `seconds = 3600`); `timeout_for` — `seconds + 30` |
 
 ### `fetch` — параллельный запрос списка URL
 

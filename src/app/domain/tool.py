@@ -95,8 +95,13 @@ class Tool[P: BaseModel, R: BaseModel](ABC):
     params_model: ClassVar[type[BaseModel]]
     # Схема результата — сохраняется в Job.result.
     result_model: ClassVar[type[BaseModel]]
-    # Предел одной попытки выполнения.
+    # Верхний предел одной попытки при любых параметрах.
     timeout_seconds: ClassVar[int]
+
+    def timeout_for(self, params: P) -> int:
+        """Предел попытки для этих параметров; не больше timeout_seconds."""
+        _ = params
+        return self.timeout_seconds
 
     @abstractmethod
     async def run(self, params: P, ctx: ToolContext) -> R:
