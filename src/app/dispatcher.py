@@ -112,7 +112,7 @@ class Dispatcher:
 
         ctx = _RunContext(job_id=job_id, attempt=attempt, http=self._http)
         try:
-            async with asyncio.timeout(tool.timeout_seconds):
+            async with asyncio.timeout(tool.timeout_for(params)):
                 result: BaseModel = await tool.run(params, ctx)
         except TimeoutError:
             if attempt < self._max_attempts:
