@@ -11,7 +11,9 @@ MAX_SECONDS = 3600
 class AsleepParams(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
-    seconds: int = Field(ge=1, le=MAX_SECONDS, description="Сколько секунд ждать.")
+    seconds: int = Field(
+        ge=1, le=MAX_SECONDS, strict=True, description="Сколько секунд ждать."
+    )
 
 
 class AsleepResult(BaseModel):
@@ -24,9 +26,12 @@ class AsleepTool(Tool[AsleepParams, AsleepResult]):
     type: ClassVar[str] = "asleep"
     params_model: ClassVar[type[BaseModel]] = AsleepParams
     result_model: ClassVar[type[BaseModel]] = AsleepResult
-    # Контракт задаёт seconds + 30, но timeout_seconds — атрибут класса,
-    # поэтому берём верхнюю границу для максимального seconds.
+    # Верхний предел для максимального seconds; для конкретного задания — timeout_for.
     timeout_seconds: ClassVar[int] = MAX_SECONDS + 30
+
+    @override
+    def timeout_for(self, params: AsleepParams) -> int:
+        return params.seconds + 30  # tool-contract §7
 
     @override
     async def run(self, params: AsleepParams, ctx: ToolContext) -> AsleepResult:
