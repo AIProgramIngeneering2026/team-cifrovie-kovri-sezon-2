@@ -47,21 +47,23 @@ class InMemoryTasks:
         if job is None or job.deleted_at is not None:
             return None
         try:
-            job.start_attempt(attempt, lease)
+            current = job.start_attempt(attempt, lease)
         except InvalidTransition as exc:
             self.rejected.append(f"{exc.action} from {exc.status}")
             return None
-        return JobToRun(id=job_id, type=job.type, params=job.params)
+        return JobToRun(id=job_id, type=job.type, params=job.params, attempt=current)
 
-    async def finish(self, job_id: str, result: object) -> None:
+    async def finish(self, job_id: str, result: object, attempt: int) -> None:
         try:
-            self.jobs[job_id].finish(result)
+            self.jobs[job_id].finish(result, attempt=attempt)
         except InvalidTransition as exc:
             self.rejected.append(f"{exc.action} from {exc.status}")
 
-    async def fail(self, job_id: str, error: Mapping[str, object]) -> None:
+    async def fail(
+        self, job_id: str, error: Mapping[str, object], attempt: int | None
+    ) -> None:
         try:
-            self.jobs[job_id].fail(error)
+            self.jobs[job_id].fail(error, attempt=attempt)
         except InvalidTransition as exc:
             self.rejected.append(f"{exc.action} from {exc.status}")
 

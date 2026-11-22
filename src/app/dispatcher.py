@@ -15,11 +15,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class JobToRun:
-    """Что Dispatcher знает о задании: тип и сохранённые параметры."""
+    """Что Dispatcher знает о задании: тип, сохранённые параметры и номер попытки."""
 
     id: str
     type: str
     params: Mapping[str, object]
+    # Сквозной номер попытки от Job (Job.start_attempt): с ним сообщается итог.
+    attempt: int
 
 
 class TaskService(Protocol):
@@ -39,9 +41,15 @@ class TaskService(Protocol):
         """
         ...
 
-    async def finish(self, job_id: str, result: object) -> None: ...
+    async def finish(self, job_id: str, result: object, attempt: int) -> None:
+        """Итог попытки attempt; итог устаревшей попытки Job отклоняет (StaleAttempt)."""
+        ...
 
-    async def fail(self, job_id: str, error: Mapping[str, object]) -> None: ...
+    async def fail(
+        self, job_id: str, error: Mapping[str, object], attempt: int | None
+    ) -> None:
+        """attempt=None — итог текущей попытки, которая сама не ответила (worker_lost)."""
+        ...
 
 
 class RetryAttempt(Exception):
@@ -79,7 +87,10 @@ class Dispatcher:
         if attempt > self._max_attempts:
             # Предыдущая попытка не вернулась: воркер упал во время выполнения.
             await self._fail(
-                job_id, "worker_lost", "Воркер аварийно завершился, попытки исчерпаны"
+                job_id,
+                None,
+                "worker_lost",
+                "Воркер аварийно завершился, попытки исчерпаны",
             )
             return
 
@@ -94,7 +105,11 @@ class Dispatcher:
             tool = self._registry.get(job.type)
         except UnknownToolError as exc:
             await self._fail(
-                job_id, exc.code, "Тип операции не поддерживается", {"type": job.type}
+                job_id,
+                job.attempt,
+                exc.code,
+                "Тип операции не поддерживается",
+                {"type": job.type},
             )
             return
 
@@ -104,6 +119,7 @@ class Dispatcher:
             fields = [".".join(str(p) for p in e["loc"]) for e in exc.errors()]
             await self._fail(
                 job_id,
+                job.attempt,
                 "invalid_params",
                 "Сохранённые параметры не подходят под схему",
                 {"fields": fields},
@@ -119,21 +135,26 @@ class Dispatcher:
                 logger.warning("job %s: таймаут попытки %s, повтор", job_id, attempt)
                 raise RetryAttempt from None
             await self._fail(
-                job_id, "timeout", "Превышено время выполнения, попытки исчерпаны"
+                job_id,
+                job.attempt,
+                "timeout",
+                "Превышено время выполнения, попытки исчерпаны",
             )
             return
         except ToolError as exc:
-            await self._tasks.fail(job_id, exc.to_dict())
+            await self._tasks.fail(job_id, exc.to_dict(), job.attempt)
             return
         except Exception:
             logger.exception("job %s: непредвиденная ошибка Tool %s", job_id, job.type)
-            await self._fail(job_id, "internal_error", "Внутренняя ошибка исполнителя")
+            await self._fail(
+                job_id, job.attempt, "internal_error", "Внутренняя ошибка исполнителя"
+            )
             return
 
-        await self._tasks.finish(job_id, result.model_dump(mode="json"))
+        await self._tasks.finish(job_id, result.model_dump(mode="json"), job.attempt)
 
     def _attempt_lease(self) -> timedelta:
-        """Дольше самого долгого timeout_seconds попытка не живёт: Tool прерывается здесь."""
+        """Дольше самого большого timeout_seconds попытка не живёт: run прерывается по timeout_for."""
         timeouts = [
             self._registry.get(t).timeout_seconds for t in self._registry.types()
         ]
@@ -142,10 +163,10 @@ class Dispatcher:
     async def _fail(
         self,
         job_id: str,
+        attempt: int | None,
         code: str,
         message: str,
         details: Mapping[str, object] | None = None,
     ) -> None:
-        await self._tasks.fail(
-            job_id, ToolError(code, message, dict(details or {})).to_dict()
-        )
+        error = ToolError(code, message, dict(details or {})).to_dict()
+        await self._tasks.fail(job_id, error, attempt)

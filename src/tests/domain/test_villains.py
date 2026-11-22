@@ -119,7 +119,7 @@ def test_z3_cancelled_job_cannot_become_finished() -> None:
     job.run()
     job.cancel()
     with pytest.raises(InvalidTransition):
-        job.finish({"text": "hi"})
+        job.finish({"text": "hi"}, attempt=job.attempt)
     assert (job.status, job.result) == (S.CANCELLED, None)
 
 
@@ -149,9 +149,12 @@ def test_z3_deleted_job_cannot_become_finished(final: JobStatus) -> None:
         job.run()
         match final:
             case S.FINISHED:
-                job.finish({"text": "hi"})
+                job.finish({"text": "hi"}, attempt=job.attempt)
             case S.FAILED:
-                job.fail({"code": "internal_error", "message": "…", "details": {}})
+                job.fail(
+                    {"code": "internal_error", "message": "…", "details": {}},
+                    attempt=job.attempt,
+                )
             case _:
                 job.cancel()
         job.delete()
@@ -159,7 +162,7 @@ def test_z3_deleted_job_cannot_become_finished(final: JobStatus) -> None:
         tool = EchoTool()
         await make_dispatcher(tasks, tool).dispatch(str(job.id), 2)
         with pytest.raises(InvalidTransition):
-            job.finish({"text": "late"})
+            job.finish({"text": "late"}, attempt=job.attempt)
         assert (job.status, tool.calls) == (final, 0)
 
     asyncio.run(scenario())
@@ -168,17 +171,54 @@ def test_z3_deleted_job_cannot_become_finished(final: JobStatus) -> None:
 def test_z4_failed_job_cannot_become_finished() -> None:
     job = make_job()
     job.run()
-    job.fail({"code": "network_error", "message": "…", "details": {}})
+    job.fail(
+        {"code": "network_error", "message": "…", "details": {}}, attempt=job.attempt
+    )
     with pytest.raises(InvalidTransition):
-        job.finish({"text": "hi"})
+        job.finish({"text": "hi"}, attempt=job.attempt)
     assert job.status == S.FAILED
+
+
+def test_z4_tool_result_from_before_retry_does_not_close_job() -> None:
+    async def scenario() -> None:
+        job = make_job()
+        tasks = InMemoryTasks(job)
+        old_tool = EchoTool(gate=asyncio.Event())
+        old = asyncio.create_task(
+            make_dispatcher(tasks, old_tool).dispatch(str(job.id), 1)
+        )
+        await old_tool.started.wait()
+        # Попытка 1 зависла: задание записали в failed, пользователь сделал retry.
+        job.fail({"code": "timeout", "message": "…", "details": {}}, attempt=None)
+        job.retry()
+        # Очередь снова начинает с попытки 1 — новый Tool уже работает.
+        new_tool = EchoTool(gate=asyncio.Event())
+        new = asyncio.create_task(
+            make_dispatcher(tasks, new_tool).dispatch(str(job.id), 1)
+        )
+        await new_tool.started.wait()
+
+        assert old_tool.gate is not None and new_tool.gate is not None
+        old_tool.gate.set()
+        await old  # старый Tool вернул результат позже, чем стартовал новый
+        assert (job.status, job.result) == (S.RUNNING, None)
+        assert tasks.rejected == ["finish from running"]
+
+        new_tool.gate.set()
+        await new
+        assert (job.status, job.attempt) == (S.FINISHED, 2)
+
+    asyncio.run(scenario())
 
 
 def test_z4_redelivery_after_fail_does_not_run_tool() -> None:
     async def scenario() -> None:
         job = make_job()
         job.run()
-        job.fail({"code": "network_error", "message": "…", "details": {}})
+        job.fail(
+            {"code": "network_error", "message": "…", "details": {}},
+            attempt=job.attempt,
+        )
         tasks = InMemoryTasks(job)
         tool = EchoTool()
         await make_dispatcher(tasks, tool).dispatch(str(job.id), 2)
@@ -191,7 +231,7 @@ def test_z4_redelivery_after_fail_does_not_run_tool() -> None:
 def test_z5_job_cannot_finish_without_running() -> None:
     job = make_job()
     with pytest.raises(InvalidTransition):
-        job.finish({"text": "hi"})
+        job.finish({"text": "hi"}, attempt=job.attempt)
     assert (job.status, job.result) == (S.CREATED, None)
 
 
@@ -199,7 +239,7 @@ def test_z5_finish_request_for_created_job_is_rejected() -> None:
     async def scenario() -> None:
         job = make_job()
         tasks = InMemoryTasks(job)
-        await tasks.finish(str(job.id), {"text": "hi"})
+        await tasks.finish(str(job.id), {"text": "hi"}, 1)
         assert job.status == S.CREATED
         assert tasks.rejected == ["finish from created"]
 
@@ -210,7 +250,7 @@ def test_z5_finish_request_for_created_job_is_rejected() -> None:
 def test_z6_finished_job_cannot_run_again(action: str) -> None:
     job = make_job()
     job.run()
-    job.finish({"text": "hi"})
+    job.finish({"text": "hi"}, attempt=job.attempt)
     with pytest.raises(InvalidTransition):
         match action:
             case "run":

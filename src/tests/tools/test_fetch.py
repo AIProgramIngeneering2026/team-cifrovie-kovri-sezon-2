@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -40,13 +41,17 @@ class Tasks:
         self.params: dict[str, object] = dict(params)
         self.outcome: tuple[str, object] | None = None
 
-    async def start(self, job_id: str) -> JobToRun | None:
-        return JobToRun(id=job_id, type="fetch", params=self.params)
+    async def start(
+        self, job_id: str, attempt: int, lease: timedelta
+    ) -> JobToRun | None:
+        return JobToRun(id=job_id, type="fetch", params=self.params, attempt=attempt)
 
-    async def finish(self, job_id: str, result: object) -> None:
+    async def finish(self, job_id: str, result: object, attempt: int) -> None:
         self.outcome = ("finished", result)
 
-    async def fail(self, job_id: str, error: Mapping[str, object]) -> None:
+    async def fail(
+        self, job_id: str, error: Mapping[str, object], attempt: int | None
+    ) -> None:
         self.outcome = ("failed", dict(error))
 
 
