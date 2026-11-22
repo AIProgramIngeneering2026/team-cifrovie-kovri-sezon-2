@@ -1,7 +1,8 @@
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from typing import override
 from uuid import UUID, uuid4
 
 
@@ -60,6 +61,31 @@ class InvalidTransition(Exception):
         }
 
 
+class StaleAttempt(InvalidTransition):
+    """Итог пришёл от попытки, которая уже не текущая: например, от Tool до retry."""
+
+    def __init__(
+        self,
+        job_id: UUID,
+        status: JobStatus,
+        action: JobAction,
+        attempt: int,
+        current_attempt: int,
+    ) -> None:
+        super().__init__(job_id, status, action)
+        self.attempt: int = attempt
+        self.current_attempt: int = current_attempt
+
+    @property
+    @override
+    def details(self) -> dict[str, str]:
+        return {
+            **super().details,
+            "attempt": str(self.attempt),
+            "current_attempt": str(self.current_attempt),
+        }
+
+
 class JobActive(Exception):
     """Удаление задания в created или running; в API — 409 task_active."""
 
@@ -95,6 +121,10 @@ class Job:
     started_at: datetime | None = None
     finished_at: datetime | None = None
     deleted_at: datetime | None = None
+    # Номер текущей попытки воркера (ARQ job_try); 0 — воркер ещё не брал задание.
+    attempt: int = 0
+    # До какого момента текущая попытка может быть жива; позже Dispatcher уже прервал Tool.
+    attempt_deadline: datetime | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -105,39 +135,83 @@ class Job:
         return self.status in allowed_from
 
     def run(self, at: datetime | None = None) -> None:
-        """created → running: воркер забрал задание."""
+        """created → running: воркер забрал задание (первая попытка)."""
         self._transition(JobAction.RUN)
+        self.attempt = 1
+        self.attempt_deadline = None
         self.started_at = at or _now()
 
-    def finish(self, result: object, at: datetime | None = None) -> None:
-        """running → finished: Tool вернул результат."""
+    def start_attempt(
+        self, attempt: int, lease: timedelta, at: datetime | None = None
+    ) -> None:
+        """Воркер начинает попытку выполнения с номером attempt на срок lease.
+
+        Из created — переход run. В running — только следующая попытка (повтор ARQ после
+        сбоя или первый запуск после retry) и только когда предыдущая точно не работает:
+        её срок истёк. Иначе в одном Job работали бы два Tool — отклоняется (З1).
+        """
+        now = at or _now()
+        if not self._can_start_next_attempt(attempt, now):
+            self._transition(
+                JobAction.RUN
+            )  # created → running, иначе InvalidTransition
+        # Попытка внутри running — не переход (job-lifecycle.md), статус не меняется.
+        self.attempt = attempt
+        self.attempt_deadline = now + lease
+        self.started_at = now
+
+    def _can_start_next_attempt(self, attempt: int, now: datetime) -> bool:
+        if self.status is not JobStatus.RUNNING or attempt <= self.attempt:
+            return False
+        return self.attempt_deadline is None or now >= self.attempt_deadline
+
+    def finish(
+        self, result: object, *, attempt: int, at: datetime | None = None
+    ) -> None:
+        """running → finished: Tool текущей попытки attempt вернул результат."""
+        self._check_attempt(JobAction.FINISH, attempt)
         self._transition(JobAction.FINISH)
+        self.attempt_deadline = None
         self.result = result
         self.finished_at = at or _now()
 
-    def fail(self, error: Mapping[str, object], at: datetime | None = None) -> None:
-        """running → failed: ошибка Tool или исчерпаны попытки."""
+    def fail(
+        self, error: Mapping[str, object], *, attempt: int, at: datetime | None = None
+    ) -> None:
+        """running → failed: ошибка Tool текущей попытки attempt или исчерпаны попытки."""
+        self._check_attempt(JobAction.FAIL, attempt)
         self._transition(JobAction.FAIL)
+        self.attempt_deadline = None
         self.error = dict(error)
         self.finished_at = at or _now()
 
     def cancel(self, at: datetime | None = None) -> None:
         """created | running → cancelled: отмена пользователем."""
         self._transition(JobAction.CANCEL)
+        self.attempt_deadline = None
         self.finished_at = at or _now()
 
-    def retry(self, at: datetime | None = None) -> None:
+    def retry(self) -> None:
         """failed → running: прежняя ошибка очищается, задание снова ждёт воркера."""
         self._transition(JobAction.RETRY)
         self.error = None
         self.finished_at = None
-        self.started_at = at or _now()
+        # Задание снова ждёт воркера: очередь начнёт нумерацию попыток заново.
+        self.attempt = 0
+        self.attempt_deadline = None
+        self.started_at = None
 
     def delete(self, at: datetime | None = None) -> None:
         """Мягкое удаление — не переход: статус не меняется (job-lifecycle.md)."""
         if self.status not in DELETABLE_STATUSES:
             raise JobActive(self.id, self.status)
         self.deleted_at = at or _now()
+
+    def _check_attempt(self, action: JobAction, attempt: int) -> None:
+        # Поздний итог старой попытки (например, Tool, запущенного до retry) не закрывает
+        # задание: итог принимается только от текущей попытки.
+        if self.status is JobStatus.RUNNING and attempt != self.attempt:
+            raise StaleAttempt(self.id, self.status, action, attempt, self.attempt)
 
     def _transition(self, action: JobAction) -> None:
         allowed_from, target = TRANSITIONS[action]
